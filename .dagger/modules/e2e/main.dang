@@ -1,0 +1,458 @@
+"""
+End-to-end coverage of Maven reactors, lifecycle phases, and configuration.
+"""
+type E2e {
+  let assert(ok: Boolean!, message: String!): Void {
+    if (ok == false) { raise message }
+    null
+  }
+
+  let run(check: Check!): Void {
+    if (check.pass == false) { raise check.error.message ?? "check failed" }
+    null
+  }
+
+  let fixture(ws: Workspace!): Directory! {
+    ws.directory("/maven/testdata/reactor")
+  }
+
+  # Deliberately failing classes prove that a selection does not run neighboring
+  # tests, including a dependency module's class with exactly the same name.
+  let classFixture(ws: Workspace!): Directory! {
+    let source = fixture(ws)
+    source
+      .withNewFile(
+        "library/pom.xml",
+        source.file("library/pom.xml").contents.replace(
+          old: "</project>",
+          new: "<dependencies><dependency><groupId>junit</groupId><artifactId>junit</artifactId></dependency></dependencies></project>",
+        ),
+      )
+      .withNewFile(
+        "pom.xml",
+        source.file("pom.xml").contents.replace(
+          old: "<systemPropertyVariables>",
+          new: "<includes><include>**/*.java</include></includes><systemPropertyVariables>",
+        ),
+      )
+      .withNewFile("library/src/test/java/example/AppTest.java", """
+        package example;
+        public class AppTest {
+          @org.junit.Test public void fails() { org.junit.Assert.fail("dependency class must not run"); }
+        }
+      """)
+      .withNewFile("app/src/test/java/example/OtherTest.java", """
+        package example;
+        public class OtherTest {
+          @org.junit.Test public void fails() { org.junit.Assert.fail("unselected class must not run"); }
+        }
+      """)
+      .withNewFile("app/src/test/java/example/SecondTest.java", """
+        package example;
+        public class SecondTest {
+          @org.junit.Test public void passes() { org.junit.Assert.assertEquals("hello", Greeting.message()); }
+        }
+      """)
+      .withNewFile("library/src/test/java/example/LibraryTest.java", """
+        package example;
+        public class LibraryTest {
+          @org.junit.Test public void passes() { org.junit.Assert.assertEquals("hello", Greeting.message()); }
+        }
+      """)
+  }
+
+  """
+  Class discovery follows conventional Java paths and configurable filename patterns.
+  """
+  testClassDiscovery: Void @check {
+    let source = directory
+      .withNewFile("pom.xml", "<project/>")
+      .withNewFile("src/test/java/TestDefault.java", "// default package")
+      .withNewFile("app/pom.xml", "<project/>")
+      .withNewFile("app/src/test/java/example/AppTest.java", "// test")
+      .withNewFile("app/src/test/java/example/AppTests.java", "// tests")
+      .withNewFile("app/src/test/java/example/AppTestCase.java", "// test case")
+      .withNewFile("app/src/test/java/example/TestApp.java", "// prefix")
+      .withNewFile("app/src/test/java/example/TestBothTest.java", "// matches two patterns")
+      .withNewFile("app/src/test/java/example/AppIT.java", "// integration test")
+      .withNewFile("app/src/test/java/example/Helper.java", "// helper")
+      .withNewFile("app/src/main/java/example/ProductionTest.java", "// production")
+      .withNewFile("app/target/generated-test-sources/GeneratedTest.java", "// generated")
+    let project = maven.project(".")
+    let expected = [
+      "./TestDefault", "app/example.AppTest", "app/example.AppTestCase",
+      "app/example.AppTests", "app/example.TestApp", "app/example.TestBothTest",
+    ]
+    assert(project.tests(source.asWorkspace).keys == expected, "incorrect conventional test class discovery")
+    assert(
+      project.tests(source.asWorkspace(cwd: "/app/src/test/java")).keys == expected,
+      "class keys changed with workspace cwd",
+    )
+    let nested = directory.withDirectory("nested/reactor", source).asWorkspace
+    assert(maven.project("nested/reactor").tests(nested).keys == expected, "class keys were not reactor relative")
+    assert(
+      maven.project(".").tests(directory.withNewFile("pom.xml", "<project/>").asWorkspace).keys.isEmpty,
+      "invented test classes",
+    )
+    let custom = source
+      .withNewFile("app/src/spec/java/example/FeatureSpec.java", "// spec")
+      .withNewFile("app/src/spec/java/example/ExcludedSpec.java", "// excluded")
+      .withNewFile("app/src/spec/java/package-info.java", "// package metadata")
+    let tool = maven(
+      testSourceDirectory: "src/spec/java",
+      testIncludes: ["**/*.java"],
+      testExcludes: ["**/ExcludedSpec.java"],
+    )
+    assert(
+      tool.project(".").tests(custom.asWorkspace).keys == ["app/example.FeatureSpec"],
+      "custom discovery patterns failed",
+    )
+    let selected = project.tests(source.asWorkspace).get(key: "app/example.AppTest")
+    assert(
+      selected.module == "app" and selected.className == "example.AppTest",
+      "incorrect class metadata",
+    )
+    null
+  }
+
+  """
+  Run a class or subset once, without running unselected classes in any module.
+  """
+  testClassSelection(ws: Workspace!): Void @check {
+    # A nested reactor also exercises mapping reactor-relative keys to workspace POMs.
+    let source = directory.withDirectory("nested/reactor", classFixture(ws)).asWorkspace
+    let project = maven(cacheKey: "maven-e2e-class-selection", args: ["-Dtest=example.OtherTest"]).project("nested/reactor")
+    let classes = project.tests(source)
+    let one = classes.get(key: "app/example.AppTest").test(source)
+    one.file("app/target/surefire-reports/TEST-example.AppTest.xml").sync
+    assert(
+      one.directory(".").glob("library/target/surefire-reports/TEST-*.xml").isEmpty,
+      "ran the dependency's identically named test",
+    )
+    assert(
+      one.directory(".").glob("app/target/surefire-reports/TEST-example.OtherTest.xml").isEmpty,
+      "ran an unselected failing class",
+    )
+    assert(
+      one.directory(".").glob("app/target/surefire-reports/TEST-example.AppIT.xml").isEmpty,
+      "POM includes escaped the class selection",
+    )
+    let batch = classes.subset(keys: ["app/example.AppTest", "app/example.SecondTest", "library/example.LibraryTest"]).batch.test(source)
+    batch.file("app/target/surefire-reports/TEST-example.AppTest.xml").sync
+    batch.file("app/target/surefire-reports/TEST-example.SecondTest.xml").sync
+    batch.file("library/target/surefire-reports/TEST-example.LibraryTest.xml").sync
+    assert(
+      batch.directory(".").glob("library/target/surefire-reports/TEST-example.AppTest.xml").isEmpty,
+      "batch ran the dependency's unselected duplicate",
+    )
+    assert(batch.stdout.split("BUILD SUCCESS").length == 2, "the subset ran more than one Maven invocation")
+    let empty = classes.subset(keys: []).batch.test(source)
+    assert(empty.directory(".").glob("**/target/**").isEmpty, "an empty subset executed Maven")
+    null
+  }
+
+  """
+  Root-module selection includes a JUnit 5 class's parameterized and nested tests.
+  """
+  testClassJunit5: Void @check {
+    let source = directory
+      .withNewFile("pom.xml", """
+        <project xmlns="http://maven.apache.org/POM/4.0.0">
+          <modelVersion>4.0.0</modelVersion>
+          <groupId>io.dagger.maven.fixture</groupId><artifactId>junit5</artifactId><version>1</version>
+          <properties><maven.compiler.release>17</maven.compiler.release></properties>
+          <dependencies><dependency>
+            <groupId>org.junit.jupiter</groupId><artifactId>junit-jupiter</artifactId><version>5.11.4</version><scope>test</scope>
+          </dependency></dependencies>
+          <build>
+            <testSourceDirectory>src/spec/java</testSourceDirectory>
+            <plugins>
+              <plugin><groupId>org.apache.maven.plugins</groupId><artifactId>maven-compiler-plugin</artifactId><version>3.14.1</version></plugin>
+              <plugin><groupId>org.apache.maven.plugins</groupId><artifactId>maven-surefire-plugin</artifactId><version>3.5.4</version></plugin>
+            </plugins>
+          </build>
+        </project>
+      """)
+      .withNewFile("src/spec/java/example/ExampleSpec.java", """
+        package example;
+        public class ExampleSpec {
+          @org.junit.jupiter.params.ParameterizedTest
+          @org.junit.jupiter.params.provider.ValueSource(strings = {"a", "b"})
+          void parameterized(String value) { org.junit.jupiter.api.Assertions.assertEquals(1, value.length()); }
+
+          @org.junit.jupiter.api.Nested
+          class NestedTests {
+            @org.junit.jupiter.api.Test
+            void nested() { org.junit.jupiter.api.Assertions.assertTrue(true); }
+          }
+        }
+      """)
+      .withNewFile("src/spec/java/example/UnselectedSpec.java", """
+        package example;
+        public class UnselectedSpec {
+          @org.junit.jupiter.api.Test
+          void fails() { org.junit.jupiter.api.Assertions.fail("unselected JUnit 5 test ran"); }
+        }
+      """)
+      .asWorkspace
+    let project = maven(
+      cacheKey: "maven-e2e-class-junit5",
+      testSourceDirectory: "src/spec/java",
+      testIncludes: ["**/*Spec.java"],
+    ).project(".")
+    let result = project.tests(source).get(key: "./example.ExampleSpec").test(source)
+    let reports = result.directory("target/surefire-reports")
+    let xml = reports.glob("TEST-*.xml").map { file => reports.file(file).contents }.join("\n")
+    assert(xml.contains("classname=\"example.ExampleSpec\""), "parameterized cases did not run")
+    assert(xml.contains("classname=\"example.ExampleSpec$NestedTests\""), "nested tests did not run")
+    assert(reports.glob("TEST-example.UnselectedSpec.xml").isEmpty, "ran an unselected JUnit 5 class")
+    null
+  }
+
+  """
+  Selected failures propagate, and skipped or unknown classes cannot silently pass.
+  """
+  testClassFailures(ws: Workspace!): Void @check {
+    let source = classFixture(ws).asWorkspace
+    let project = maven(cacheKey: "maven-e2e-class-failures", args: ["-Dmaven.test.failure.ignore=true"]).project(".")
+    let failed = { project.tests(source).get(key: "app/example.OtherTest").test(source).sync; "passed" } rescue {
+      err: Error => err.message
+    }
+    assert(failed != "passed", "a selected failing class passed")
+    let unknown = { project.tests(source).get(key: "app/example.UnknownTest").test(source).sync; "passed" } rescue {
+      err: Error => err.message
+    }
+    assert(unknown != "passed", "an unknown class passed")
+    let skipped = {
+      maven(cacheKey: "maven-e2e-class-failures", args: ["-DskipTests"])
+        .project(".")
+        .tests(source)
+        .get(key: "app/example.AppTest")
+        .test(source)
+        .sync
+      "passed"
+    } rescue {
+      err: Error => err.message
+    }
+    assert(skipped.contains("no test cases ran"), "a skipped class silently passed: " + skipped)
+    # Full verify must still run classes omitted from discovery.
+    let hidden = maven(cacheKey: "maven-e2e-class-failures", testExcludes: ["**/OtherTest.java", "**/AppTest.java"])
+    assert(hidden.project(".").verify(source).pass == false, "discovery filters weakened the full verify check")
+    null
+  }
+
+  """
+  Discovery avoids duplicate reactors, honors cwd, and supports explicit roots.
+  """
+  discovery: Void @check {
+    let source = directory
+      .withNewFile("one/pom.xml", "<project/>")
+      .withNewFile("one/child/pom.xml", "<project/>")
+      .withNewFile("two/pom.xml", "<project/>")
+      .withNewFile("one/target/generated/pom.xml", "<project/>")
+      .withNewFile(".m2/pom.xml", "<project/>")
+      .withNewFile("one/child/src/Main.java", "// source")
+    let ws = source.asWorkspace
+    assert(maven.projects(ws).keys == ["one", "two"], "expected two reactor roots")
+    assert(
+      maven.projects(source.asWorkspace(cwd: "/one/child/src")).keys == ["one"],
+      "cwd inside a member must retain the enclosing reactor",
+    )
+    assert(
+      maven(roots: ["one/child", "two"]).projects(ws).keys == ["one/child", "two"],
+      "explicit roots did not override discovery",
+    )
+    assert(maven.projects(directory.asWorkspace).keys.isEmpty, "empty workspace invented a project")
+    let invalid = { maven.project("../escape").path } rescue {
+      err: Error => err.message
+    }
+    assert(invalid.contains("workspace-relative"), "accepted a path outside the workspace")
+    let missing = { maven.project("missing").container(ws).sync; "passed" } rescue {
+      err: Error => err.message
+    }
+    assert(missing.contains("no pom.xml"), "missing POM was not diagnosed")
+    null
+  }
+
+  """
+  Host targets are excluded while Maven config, sources, and siblings survive.
+  """
+  sourcePolicy: Void @check {
+    let ws = directory
+      .withNewFile("pom.xml", "<project/>")
+      .withNewFile(".mvn/maven.config", "-Pci")
+      .withNewFile("mvnw", "#!/bin/sh\n")
+      .withNewFile("child/src/main/resources/config.txt", "resource")
+      .withNewFile("sibling/pom.xml", "<project/>")
+      .withNewFile("target/stale.jar", "stale")
+      .withNewFile("child/target/stale.jar", "stale")
+      .withNewFile(".m2/settings.xml", "host settings")
+      .withNewFile(".git/config", "host git config")
+      .asWorkspace
+    let source = maven.source(ws)
+    assert(source.glob("**/target/**").isEmpty, "host targets leaked into source")
+    assert(source.glob("**/.m2/**").isEmpty, "host Maven home leaked into source")
+    assert(source.glob("**/.git/**").isEmpty, "host git data leaked into source")
+    assert(source.file(".mvn/maven.config").contents == "-Pci", "lost Maven config")
+    assert(source.file("sibling/pom.xml").contents == "<project/>", "lost sibling POM")
+    assert(
+      source.file("child/src/main/resources/config.txt").contents == "resource",
+      "lost resources",
+    )
+    null
+  }
+
+  """
+  Wrapper choice, literal arguments, custom base, secrets, and toolchains.
+  """
+  configuration: Void @check {
+    let source = directory
+      .withNewFile("pom.xml", "<project/>")
+      .withNewFile("mvnw", "#!/bin/sh\nprintf 'wrapper\\n'\nprintf '%s\\n' \"$@\"\n")
+    let base = container
+      .from("alpine:3.23")
+      .withNewFile(
+        "/usr/local/bin/mvn",
+        "#!/bin/sh\nprintf 'maven\\n'\nprintf '%s\\n' \"$@\"\n",
+        permissions: 493,
+      )
+    let tool = maven(
+      base: base,
+      args: ["-Pci", "-Dmessage=a value; $(not-a-command)"],
+      settings: setSecret("maven-e2e-settings", "<settings/>"),
+      toolchains: directory.withNewFile("toolchains.xml", "<toolchains/>").file("toolchains.xml"),
+      cacheKey: "maven-e2e-configuration",
+    )
+    let result = tool.project(".").run(source.asWorkspace, ["validate"], args: ["-pl", "app", "-am"])
+    let output = result.stdout
+    assert(output.hasPrefix("wrapper\n"), "did not prefer non-executable wrapper")
+    assert(output.contains("-Dmessage=a value; $(not-a-command)\n"), "arguments were split or shell-expanded")
+    assert(output.contains("--batch-mode\n--no-transfer-progress\n"), "missing CI flags")
+    assert(output.contains("-pl\napp\n-am\n"), "lost reactor selection flags")
+    assert(output.contains("--settings\n/maven-settings.xml\n"), "missing settings argument")
+    assert(output.contains("--toolchains\n/maven-toolchains.xml\n"), "missing toolchains argument")
+    result.withExec(["sh", "-eu", "-c", "test -f /maven-settings.xml; test -f /maven-toolchains.xml; test \"$MAVEN_USER_HOME\" = /maven"]).sync
+    assert(
+      maven(base: base, useWrapper: false).project(".").run(
+        source.asWorkspace,
+        ["validate"],
+      ).stdout.hasPrefix("maven\n"),
+      "useWrapper=false did not force Maven",
+    )
+    assert(
+      maven(base: base).project(".").run(
+        source.withoutFile("mvnw").asWorkspace,
+        ["validate"],
+      ).stdout.hasPrefix("maven\n"),
+      "missing wrapper did not fall back to Maven",
+    )
+    let empty = { tool.project(".").run(source.asWorkspace, []).sync; "passed" } rescue {
+      err: Error => err.message
+    }
+    assert(empty.contains("at least one Maven goal"), "accepted empty goals")
+    null
+  }
+
+  """
+  Compile, test, package and verify a reactor with an inter-module dependency.
+  """
+  lifecycle(ws: Workspace!): Void @check {
+    let project = maven(cacheKey: "maven-e2e-reactor").project(".")
+    let source = fixture(ws).withNewFile("app/target/host-only.txt", "must not enter build").asWorkspace
+    project.compile(source).file("app/target/classes/example/App.class").sync
+    project.test(source).file("app/target/surefire-reports/TEST-example.AppTest.xml").sync
+    let outputs = project.build(source)
+    outputs.file("library/target/library-1.0-SNAPSHOT.jar").sync
+    outputs.file("app/target/app-1.0-SNAPSHOT.jar").sync
+    assert(outputs.glob("**/host-only.txt").isEmpty, "build reused host targets")
+    run(project.verify(source))
+    let reports = project.reports(source)
+    assert(
+      reports.file("app/target/surefire-reports/TEST-example.AppTest.xml").contents.contains("tests=\"1\""),
+      "unit test did not run",
+    )
+    assert(
+      reports.file("app/target/failsafe-reports/TEST-example.AppIT.xml").contents.contains("tests=\"1\""),
+      "integration test did not run",
+    )
+    assert(reports.glob("**/*.jar").isEmpty, "reports included artifacts")
+    null
+  }
+
+  """
+  Failures propagate from both Surefire and Failsafe, including batch checks.
+  """
+  failures(ws: Workspace!): Void @check {
+    let source = fixture(ws)
+    let badUnit = source.withNewFile("app/src/test/java/example/AppTest.java", """
+      package example;
+      public class AppTest {
+        @org.junit.Test public void fails() { org.junit.Assert.fail("unit sentinel"); }
+      }
+    """).asWorkspace
+    let badIntegration = source.withNewFile(
+      "app/src/test/java/example/AppIT.java",
+      """
+        package example;
+        public class AppIT {
+          @org.junit.Test public void fails() { org.junit.Assert.fail("integration sentinel"); }
+        }
+      """,
+    ).asWorkspace
+    let tool = maven(cacheKey: "maven-e2e-failures")
+    assert(tool.project(".").verify(badUnit).pass == false, "unit test failure passed verify")
+    assert(tool.project(".").verify(badIntegration).pass == false, "integration failure passed verify")
+    assert(
+      tool.project(".").reports(badUnit).file("app/target/surefire-reports/TEST-example.AppTest.xml").contents.contains("failures=\"1\""),
+      "could not export reports from failing unit tests",
+    )
+    assert(
+      tool.project(".").reports(badIntegration).file("app/target/failsafe-reports/TEST-example.AppIT.xml").contents.contains("failures=\"1\""),
+      "could not export reports from failing integration tests",
+    )
+    let batch = directory
+      .withDirectory("bad-unit", source.withDirectory(".", badUnit.directory("/")))
+      .withDirectory("bad-integration", badIntegration.directory("/"))
+      .asWorkspace
+    let check = tool.projects(batch).batch.verify(batch)
+    assert(check.pass == false, "failing reactors passed batch verify")
+    let message = check.error.message ?? ""
+    assert(
+      message.contains("- bad-unit:") and message.contains("- bad-integration:"),
+      "batch did not report both reactors: " + message,
+    )
+    null
+  }
+
+  """
+  A generated Apache wrapper selects its pinned version and builds a single module.
+  """
+  wrapper(ws: Workspace!): Void @check {
+    let tool = maven(cacheKey: "maven-e2e-wrapper")
+    let generated = tool.project(".").run(
+      fixture(ws).asWorkspace,
+      ["org.apache.maven.plugins:maven-wrapper-plugin:3.3.4:wrapper"],
+      args: ["-N", "-Dmaven=3.9.9", "-Dtype=only-script"],
+    ).directory("/src").asWorkspace
+    assert(
+      tool.project(".").run(generated, ["--version"]).stdout.contains("Apache Maven 3.9.9"),
+      "the real wrapper did not select its pinned Maven version",
+    )
+    # A standalone library build still sees its parent POM outside its root.
+    tool.project("library").build(generated).file("target/library-1.0-SNAPSHOT.jar").sync
+    null
+  }
+
+  """
+  Install artifacts and deploy only to a disposable container-local repository.
+  """
+  publishing(ws: Workspace!): Void @check {
+    let source = fixture(ws).asWorkspace
+    let project = maven(cacheKey: "maven-e2e-publishing").project(".")
+    let installed = project.install(source)
+    installed.withExec(["test", "-f", "/maven/repository/io/dagger/maven/fixture/app/1.0-SNAPSHOT/app-1.0-SNAPSHOT.jar"]).sync
+    let output = project.deploy(source, args: ["-DaltDeploymentRepository=fixture::file:///tmp/deployed"])
+    assert(output.contains("BUILD SUCCESS"), "file repository deployment did not succeed")
+    null
+  }
+}

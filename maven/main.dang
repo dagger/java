@@ -1,0 +1,498 @@
+"""
+Build, test, and publish Maven projects using their own POMs and Maven wrappers.
+Multi-module projects run as a reactor, preserving Maven's dependency ordering.
+"""
+type Maven {
+  """
+  Maven release used when there is no wrapper. Ignored with base.
+  """
+  mavenVersion: String! = "3.9.16"
+
+  """
+  Eclipse Temurin JDK version for the default image. Ignored with base.
+  """
+  javaVersion: String! = "21"
+
+  """
+  Custom container with a JDK, sh, and Maven (or wrapper prerequisites).
+  """
+  base: Container
+
+  """
+  Use mvnw when present at the project root; otherwise use mvn.
+  """
+  useWrapper: Boolean! = true
+
+  """
+  Arguments for every invocation, e.g. profiles, properties, or -pl/-am.
+  """
+  args: [String!]! = []
+
+  """
+  Explicit workspace-relative reactor roots. Empty discovers outermost POMs.
+  Set this for independently built projects nested beneath another POM.
+  """
+  roots: [String!]! = []
+
+  """
+  Secret settings.xml, for private repositories, mirrors, and deployment.
+  """
+  settings: Secret
+
+  """
+  Optional toolchains.xml. JDK paths must exist in the base container.
+  """
+  toolchains: File
+
+  """
+  Cache namespace override. Empty isolates caches by workspace and project.
+  This holds the local repository and wrapper distributions, never settings.
+  """
+  cacheKey: String! = ""
+
+  """
+  Java test source directory relative to each POM, used only for class discovery.
+  Maven's own source and plugin configuration still controls compilation.
+  """
+  testSourceDirectory: String! = "src/test/java"
+
+  """
+  Class discovery patterns relative to testSourceDirectory. These are Surefire's
+  conventional Java filenames; discovery does not evaluate the effective POM.
+  """
+  testIncludes: [String!]! = ["**/Test*.java", "**/*Test.java", "**/*Tests.java", "**/*TestCase.java"]
+
+  """
+  Patterns excluded from test-class discovery, relative to testSourceDirectory.
+  """
+  testExcludes: [String!]! = []
+
+  let excludes: [String!]! = ["**/.git/**", "**/target/**", "**/.m2/**", "**/node_modules/**"]
+
+  # Keep all types together: installed multi-file Dang modules cannot yet
+  # consistently convert Workspace arguments (dagger/dagger#13476).
+  let relativePath(path: String!): String! {
+    if (path.hasPrefix("/") or path.split("/").contains("..")) {
+      raise "expected a workspace-relative path without '..': " + path
+    }
+    let normalized = path.split("/").reject { part => part == "" or part == "." }.join("/")
+    if (normalized == "") { "." } else { normalized }
+  }
+
+  let within(path: String!, root: String!): Boolean! {
+    root == "." or path == root or path.hasPrefix(root + "/")
+  }
+
+  # findRoots returns paths relative to the workspace cwd, even with start=/.
+  let rootPath(ws: Workspace!, path: String!): String! {
+    let parts = path.split("/").reject { part => part == "" or part == "." }
+    let up = parts.filter { part => part == ".." }.length
+    let resolved = ws
+      .cwd
+      .split("/")
+      .reject { part => part == "" }
+      .dropLast(up) + parts.reject { part => part == ".." }
+    if (resolved.isEmpty) { "." } else { resolved.join("/") }
+  }
+
+  """
+  Reactor roots in view, keyed by workspace-relative directory. Discovery uses
+  outermost pom.xml directories so reactor members are not built twice.
+  From inside a reactor, that whole reactor remains selected.
+  """
+  projects(ws: Workspace!): MavenProjects! {
+    let found = if (roots.isEmpty) {
+      ws
+        .findRoots(markers: ["pom.xml"], start: "/", exclude: excludes)
+        .map { path => rootPath(ws, path) }
+        .uniq
+    } else {
+      roots.map { path => relativePath(path) }.uniq
+    }
+    let candidates = if (roots.isEmpty) {
+      found.reject { path =>
+        found.any { other =>
+          other != path and within(
+            path,
+            other,
+          )
+        }
+      }
+    } else { found }
+    let cwd = relativePath(ws.cwd.trimPrefix("/"))
+    let selected = candidates.filter { path =>
+      within(path, cwd) or within(
+        cwd,
+        path,
+      )
+    }
+    let empty: [String!]! = []
+    let sorted = selected.reduce(empty) { acc, path =>
+      acc.takeWhile { item => item <= path } + [path] + acc.dropWhile { item => item <= path }
+    }
+    MavenProjects(paths: sorted, tool: self)
+  }
+
+  """
+  A specific reactor root, relative to the workspace root.
+  """
+  project(path: String!): MavenProject! {
+    MavenProject(path: relativePath(path), tool: self)
+  }
+
+  """
+  Workspace source, preserving sibling modules, relative parents, .mvn config,
+  resources, and build scripts. Host targets and dependency caches are excluded.
+  """
+  source(ws: Workspace!): Directory! {
+    ws.directory("/", exclude: excludes)
+  }
+
+  let image: Container! {
+    base ?? container.from("maven:" + mavenVersion + "-eclipse-temurin-" + javaVersion)
+  }
+}
+
+"""
+Maven reactor roots keyed by workspace-relative directory.
+"""
+type MavenProjects @collection {
+  """
+  Reactor root directories.
+  """
+  paths: [String!]! @keys
+
+  let tool: Maven!
+
+  """
+  The reactor rooted at this path.
+  """
+  project(path: String!): MavenProject! @get {
+    tool.project(path)
+  }
+
+  """
+  Verify every selected reactor and report every failing project.
+  """
+  verify(ws: Workspace!): Void @check {
+    let failures = paths.map { path => project(path) }.{{path, failure: verifyFailure(ws)}}
+      .filter { result => result.failure != null }
+    if (failures.isEmpty == false) {
+      raise "Maven verify failed:\n" + failures.map { result =>
+        "- " + result.path + ": " + (result.failure ?? "")
+      }.join("\n")
+    }
+    null
+  }
+}
+
+"""
+One Maven project, including all modules selected by its POM and profiles.
+"""
+type MavenProject {
+  """
+  Reactor root relative to the workspace root.
+  """
+  path: String!
+
+  let tool: Maven!
+
+  let workdir: String! { if (path == ".") { "/src" } else { "/src/" + path } }
+
+  let subpath(name: String!): String! {
+    if (path == ".") { name } else { path + "/" + name }
+  }
+
+  let executable(ws: Workspace!): [String!]! {
+    if (tool.useWrapper and tool.source(ws).glob(subpath("mvnw")).isEmpty == false) {
+      # sh also handles wrappers checked out without the executable bit.
+      ["sh", "./mvnw"]
+    } else { ["mvn"] }
+  }
+
+  let command(ws: Workspace!, goals: [String!]!, args: [String!]!): [String!]! {
+    if (goals.isEmpty) { raise "provide at least one Maven goal or lifecycle phase" }
+    executable(ws) + ["--batch-mode", "--no-transfer-progress"]
+      + tool.args + goals + args
+      + ["-Dmaven.repo.local=/maven/repository"]
+      + (if (tool.settings != null) { ["--settings", "/maven-settings.xml"] } else { [] })
+      + (if (tool.toolchains != null) { ["--toolchains", "/maven-toolchains.xml"] } else { [] })
+  }
+
+  """
+  Prepared container for customization, services, and debugging. Caches are
+  locked because separate Maven processes must not write one repository at once.
+  """
+  container(ws: Workspace!): Container! {
+    if (tool.source(ws).glob(subpath("pom.xml")).isEmpty) {
+      raise "no pom.xml at Maven project root: " + path
+    }
+    let key = if (tool.cacheKey == "") { "maven-" + ws.address + "-" + path } else { tool.cacheKey }
+    let ctr = tool
+      .image
+      .withoutEntrypoint
+      .withEnvVariable("MAVEN_USER_HOME", "/maven")
+      .withMountedCache("/maven", cacheVolume(key), sharing: CacheSharingMode.LOCKED)
+      .withDirectory("/src", tool.source(ws))
+      .withWorkdir(workdir)
+    let settings = tool.settings
+    let toolchains = tool.toolchains
+    let configured = if (settings != null) {
+      ctr.withMountedSecret("/maven-settings.xml", settings)
+    } else { ctr }
+    if (toolchains != null) {
+      configured.withMountedFile("/maven-toolchains.xml", toolchains)
+    } else { configured }
+  }
+
+  """
+  Run goals or lifecycle phases. Return the container for chaining or extracting
+  custom outputs. Set fresh for snapshot refreshes or commands with side effects.
+  """
+  run(
+    ws: Workspace!,
+    goals: [String!]!,
+    args: [String!]! = [],
+    fresh: Boolean! = false,
+  ): Container! {
+    let ctr = container(ws)
+    let ready = if (fresh) { ctr.withEnvVariable("DAGGER_MAVEN_RUN", UUID.v7) } else { ctr }
+    ready.withExec(command(ws, goals, args))
+  }
+
+  """
+  Compile production sources and return the resulting container.
+  """
+  compile(ws: Workspace!, args: [String!]! = []): Container! {
+    run(ws, ["compile"], args)
+  }
+
+  """
+  Run unit tests. Full verification, including integration tests, uses verify.
+  """
+  test(ws: Workspace!, args: [String!]! = []): Container! {
+    run(ws, ["test"], args)
+  }
+
+  # POM directories below this reactor, relative to its root. Maven, rather
+  # than discovery, decides which of them belong to the active reactor.
+  let pomDirectories(source: Directory!): [String!]! {
+    source.glob("**/pom.xml").map { file =>
+      let parent = file.split("/").dropLast(1).join("/")
+      if (parent == "") { "." } else { parent }
+    }
+  }
+
+  let modulePath(module: String!, name: String!): String! {
+    if (module == ".") { name } else { module + "/" + name }
+  }
+
+  """
+  Java unit-test class candidates, keyed by reactor-relative module directory
+  and fully qualified class name, e.g. app/example.AppTest. Listing runs no
+  Maven command. Names are inferred from paths beneath testSourceDirectory.
+  Class operations are explicit, leaving verify as the only automatic check.
+  """
+  tests(ws: Workspace!): MavenTestClasses! {
+    let source = tool.source(ws).directory(path)
+    if (source.glob("pom.xml").isEmpty) {
+      raise "no pom.xml at Maven project root: " + path
+    }
+    let testDir = tool.relativePath(tool.testSourceDirectory)
+    let empty: [String!]! = []
+    let names = pomDirectories(source).reduce(empty) { names, module =>
+      let testPath = modulePath(module, testDir)
+      let prefix = if (testPath == ".") { "" } else { testPath + "/" }
+      let excluded = tool.testExcludes.reduce(empty) { files, pattern => files + source.glob(prefix + pattern) }
+      let included = tool.testIncludes.reduce(empty) { files, pattern => files + source.glob(prefix + pattern) }
+      names + included
+        .uniq
+        .reject { file => excluded.contains(file) }
+        .filter { file => file.hasSuffix(".java") }
+        .map { file =>
+          file.trimPrefix(prefix).trimSuffix(".java").replace(
+            old: "/",
+            new: ".",
+          )
+        }
+        # Ignore package-info/module-info and paths that cannot name a Java class.
+        .filter { name =>
+          name.replaceMatches(
+            `^[\p{L}_$][\p{L}\p{N}_$]*(\.[\p{L}_$][\p{L}\p{N}_$]*)*$`,
+            with: "",
+          ) == ""
+        }
+        .map { name => module + "/" + name }
+    }
+    let sorted = names.uniq.reduce(empty) { acc, name =>
+      acc.takeWhile { item => item <= name } + [name] + acc.dropWhile { item => item <= name }
+    }
+    MavenTestClasses(names: sorted, project: self)
+  }
+
+  # Use project-relative selection files so two modules can have the same
+  # class name without selecting one another's tests. Maven resolves File
+  # parameters relative to each POM. The inverse exclusion also restricts any
+  # includes already configured in the POM. An empty -Dtest clears CLI selectors
+  # that would otherwise bypass Surefire's include/exclude files altogether.
+  let runClasses(ws: Workspace!, names: [String!]!): Container! {
+    let known = tests(ws).names
+    let missing = names.reject { name => known.contains(name) }
+    if (missing.isEmpty == false) {
+      raise "unknown Maven test classes: " + missing.join(", ")
+    }
+    if (names.isEmpty) {
+      container(ws)
+    } else {
+      let source = tool.source(ws)
+      let ready = pomDirectories(source).reduce(container(ws)) { ctr, module =>
+        let selected = names.filter { name =>
+          subpath(name.split("/").dropLast(1).join("/")).trimSuffix("/.") == module
+        }
+        let patterns = selected.map { name =>
+          "\\Q" + name.split("/").takeLast(1).join("").replace(old: ".", new: "/") + "\\E\\.class"
+        }
+        let includes = patterns.map { pattern => "%regex[" + pattern + "]" }.join("\n")
+        let excludes = if (patterns.isEmpty) { "%regex[.*]" } else {
+          "%regex[(?!" + patterns.map { pattern => pattern + "$" }.join("|") + ").*]"
+        }
+        let files = "/src/" + modulePath(module, ".dagger-maven-tests")
+        # Surefire accepts negated regexes in includesFile. Its excludesFile
+        # parser rejects every '!', including negative-lookahead syntax.
+        ctr.withNewFile(files + "/includes", includes + "\n!" + excludes + "\n")
+      }
+      let result = ready.withExec(command(ws, ["test"], [
+        "-Dtest=",
+        "-Dsurefire.includesFile=.dagger-maven-tests/includes",
+        "-DfailIfNoTests=false",
+        "-Dmaven.test.failure.ignore=false",
+      ]))
+      # Empty or inactive modules are normal in a reactor, but a requested class
+      # silently running zero tests is not. Inspect actual test cases, not merely
+      # a report filename (abstract helpers can produce empty reports).
+      let absent = names.reject { name =>
+        let module = name.split("/").dropLast(1).join("/")
+        let className = name.split("/").takeLast(1).join("")
+        let reports = result.directory(module).glob("target/surefire-reports/TEST-*.xml")
+        reports.any { report =>
+          let xml = result.directory(module).file(report).contents
+          xml.contains("classname=\"" + className + "\"") or xml.contains("classname=\"" + className + "$")
+        }
+      }
+      if (absent.isEmpty == false) {
+        raise "no test cases ran for Maven classes: " + absent.join(", ")
+          + "; check active profiles, source layout, skip flags, and Surefire XML report configuration"
+      }
+      result
+    }
+  }
+
+  """
+  Package the reactor, running unit tests by default, and return its target
+  trees, preserving module paths. Use run for custom build directories.
+  """
+  build(ws: Workspace!, args: [String!]! = []): Directory! {
+    directory.withDirectory(".", run(ws, ["package"], args).directory("."), include: ["**/target/**"])
+  }
+
+  """
+  Run through verify: unit tests, packaging, integration tests, and quality gates.
+  """
+  verify(ws: Workspace!): Void @check {
+    run(ws, ["verify"]).sync
+    null
+  }
+
+  let verifyFailure(ws: Workspace!): String {
+    { run(ws, ["verify"]).sync; null } rescue {
+      err: Error => err.message
+    }
+  }
+
+  """
+  Return Surefire/Failsafe reports with reactor-relative paths, including failed
+  tests. Test failures are ignored only here so reports can be exported; use the
+  verify check for the pass/fail verdict. Compilation and plugin errors still fail.
+  """
+  reports(ws: Workspace!, args: [String!]! = []): Directory! {
+    directory.withDirectory(
+      ".",
+      run(ws, ["verify"], args + ["-Dmaven.test.failure.ignore=true"]).directory("."),
+      include: ["**/target/surefire-reports/**", "**/target/failsafe-reports/**"],
+    )
+  }
+
+  """
+  Verify and install into this project's cached local repository. Return the
+  container to continue work in the same repository. Always execute the install
+  so a cached result cannot hide an evicted cache volume's missing artifacts.
+  """
+  install(ws: Workspace!, args: [String!]! = []): Container! {
+    run(ws, ["install"], args, fresh: true)
+  }
+
+  """
+  Verify and deploy using the POM's distributionManagement and secret settings.
+  Explicit only: never a check. Always executes, even for unchanged source.
+  """
+  deploy(ws: Workspace!, args: [String!]! = []): String! {
+    run(ws, ["deploy"], args, fresh: true).stdout
+  }
+}
+
+"""
+Java unit-test classes in one reactor. Keys combine the reactor-relative POM
+directory and class name. Selection is explicit and does not change verify.
+"""
+type MavenTestClasses @collection {
+  """
+  Class keys, e.g. app/example.AppTest or ./example.RootTest.
+  """
+  names: [String!]! @keys
+
+  let project: MavenProject!
+
+  """
+  One test class by its module/class key.
+  """
+  testClass(key: String!): MavenTestClass! @get {
+    MavenTestClass(key: key, project: project)
+  }
+
+  """
+  Run all selected classes in one Maven reactor invocation. Dependencies still
+  build in reactor order; unselected classes do not run. An empty subset is a no-op.
+  """
+  test(ws: Workspace!): Container! {
+    project.runClasses(ws, names)
+  }
+}
+
+"""
+One Java unit-test class discovered from a conventional source path.
+"""
+type MavenTestClass {
+  """
+  Reactor-relative module directory followed by the fully qualified class name.
+  """
+  key: String!
+
+  let project: MavenProject!
+
+  """
+  Module directory relative to the reactor root.
+  """
+  module: String! { key.split("/").dropLast(1).join("/") }
+
+  """
+  Fully qualified Java class name.
+  """
+  className: String! { key.split("/").takeLast(1).join("") }
+
+  """
+  Run this class, building reactor dependencies as needed.
+  """
+  test(ws: Workspace!): Container! {
+    project.runClasses(ws, [key])
+  }
+}
