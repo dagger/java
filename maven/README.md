@@ -1,7 +1,8 @@
 # Maven
 
 A [Dagger](https://dagger.io) module written in Dang for compiling, testing,
-packaging, and publishing Maven projects. Requires Dagger v1.0.0-beta.21 or later.
+packaging, and publishing Maven projects. Requires Dagger v1.0.0-beta.22 or later,
+for selected collection arguments on checks.
 
 ## Install and verify
 
@@ -12,11 +13,14 @@ dagger check --module maven
 
 For local development, install this directory's path instead of the GitHub URL.
 
-The default check runs `mvn verify` on every selected reactor. This includes unit
-tests, packaging, and any integration tests and quality gates configured in the
-POM. It runs the complete [Maven lifecycle](https://maven.apache.org/guides/introduction/introduction-to-the-lifecycle.html)
-through verification, including `post-integration-test` cleanup. The module
-does not add test or lint plugins to your POM.
+`dagger check` runs one check per discovered Java unit-test class, plus a
+`verify` check per reactor (see [Test class checks](#test-class-checks)). One
+`mvn verify` per reactor serves all of them: unit tests, packaging, and any
+integration tests and quality gates configured in the POM, through the complete
+[Maven lifecycle](https://maven.apache.org/guides/introduction/introduction-to-the-lifecycle.html)
+including `post-integration-test` cleanup. The module does not add test or lint
+plugins to your POM. Each failure is reported by exactly one kind of check: a
+class check for its class and module, `verify` for the rest of the reactor.
 
 Use `dagger check` for CI verdicts. Calling a check through the API returns a
 `Check`; inspect its `pass` field to run it and obtain the verdict.
@@ -59,45 +63,81 @@ dagger -c 'maven | projects | get services/api | build | export ./dist'
 dagger -c 'maven | project --path=services/api | run --goals=dependency:tree | stdout'
 ```
 
-## Selecting test classes
+## Test class checks
 
-Each project exposes a `tests` collection of Java unit-test class candidates.
-Keys combine the **reactor-relative module directory** and fully qualified
-class name: `app/example.AppTest`, or `./example.RootTest` for a class in the
-reactor root itself.
+Each project has three collection levels, each adding a `dagger check` flag:
+
+| Collection | Keys | Flag |
+| --- | --- | --- |
+| `projects` | Reactor root, relative to the workspace | `--maven-project` |
+| `modules(ws)` on a project | POM directory, relative to the workspace | `--maven-module` |
+| `tests` on a module | Fully qualified class name | `--maven-test` |
+
+The reactor owns the container, cache, toolchain, and Maven command, so it is
+the unit that runs. Modules are the directories Maven builds within it. A test
+class is the finest unit Surefire both filters and reports individually, in its
+XML reports; individual methods and runtime parameter values are not separate
+collection items. Listing runs no Maven command.
 
 ```sh
-# List candidates without compiling or running Maven.
-dagger -c 'maven | project --path=. | tests | keys'
-
-# Run one class, including its parameterized and nested test cases.
-dagger -c 'maven | project --path=. | tests | get app/example.AppTest | test | stdout'
+dagger list maven-tests -a
+dagger check --maven-module=app                                  # every class in one module
+dagger check --maven-test=example.AppTest                        # that class in every module
+dagger check --maven-module=app --maven-test=example.AppTest     # one class
+dagger check --maven-project=services/api                        # one reactor, including verify
 ```
 
-From another Dang module, select several classes using `subset` and run them
-together through `batch`:
+A class name in two modules selects both; `--maven-module` narrows that.
+`--maven-module` and `--maven-test` leave out the reactor's verify check, which
+does not belong to those collections.
 
-```dang
-let classes = maven.project(".").tests(ws)
-classes.subset(keys: [
-  "app/example.AppTest",
-  "library/example.LibraryTest",
-]).batch.test(ws).sync
-```
+Every class check in a reactor receives the engine's filtered module
+collection and calls one shared helper, which runs one Maven command for the
+selection and indexes its reports. The engine deduplicates identical container
+operations, so each reactor runs Maven once however many classes are selected.
+Separate reactors run separately, in parallel.
 
-A selection runs **one `mvn test` invocation for the reactor**, with a separate
-Surefire filter for each module. Classes with identical names in different
-modules remain independently selectable. Dependencies build in reactor order;
-unselected tests still compile, but do not run. An empty subset does not invoke
-Maven. Unknown classes fail, and a selected class producing no test cases in
-Surefire's XML reports fails with a diagnostic rather than silently succeeding.
-The returned container contains the selected classes' reports and build outputs.
-Collection selections override `-Dtest` and `surefire.includesFile`, and force
-test failures to propagate even if module arguments request ignoring them.
+- With nothing selected out, the command is
+  `mvn verify --fail-at-end -Dmaven.test.failure.ignore=true`, the same command
+  the reactor's verify check runs.
+- Otherwise it is `mvn test --fail-at-end` with a Surefire filter file in every
+  module that selects exactly its chosen classes. Dependencies build in reactor
+  order; unselected tests still compile but do not run, and integration tests
+  do not run. Selections override `-Dtest` and `surefire.includesFile` from
+  `args`.
 
-These collection operations are explicit calls, not additional `@check`
-functions. `dagger check` still performs full `verify`, including tests that
-class discovery does not list. Discovery filters never weaken that check.
+Test failures never stop the shared command, and `--fail-at-end` keeps a
+failed module from stopping independent ones, so every selected class gets its
+own result. A small indexer in a pinned JDK image reads the Surefire and
+Failsafe XML reports and Maven's per-project failures (`Failed to execute goal
+... on project <artifactId>`, mapped to POM directories) once, and writes one
+bounded result per check: the last 32 KiB of each diagnostic stream, at most
+96 KiB in all. Each check reads only its own. Blame goes to the finest unit:
+
+- A failed or errored test case fails its class's check, including nested and
+  parameterized cases. Other classes still pass.
+- A module whose goal failed (compilation, dependency resolution, plugin,
+  forked VM) fails that module's class checks. Classes in modules Maven then
+  skipped did not run, and fail saying which module stopped them. Other
+  modules' classes pass or fail on their own results.
+- A failed test case in a class without a check (an integration test or an
+  undiscovered class) fails the class checks of its module.
+- Everything else belongs to the reactor: failures in modules without
+  selected class checks, failures Maven attributes to no module directory, a
+  non-zero exit without a project failure, and failures Maven logs that no
+  standard report records. In a whole run the reactor's `verify` check reports
+  them, and only it. In a narrowed run, which has no verify check, every
+  selected class check sharing the command fails with them.
+- A selected class with no test case in the reports fails as "did not run",
+  rather than passing: check active profiles, source layout, skip flags such
+  as `-DskipTests`, and Surefire's XML report configuration.
+
+So a failing test fails its class check and not `verify`, and a failed
+packaging step in a module without tests fails `verify` and not the class
+checks. Selecting every key explicitly, or only checks named `test`, is a whole
+run without the verify check, so reactor-level failures are not reported by
+that invocation. Logs and spans belong to whichever check started the shared
+command; the others share its result.
 
 Discovery defaults to `src/test/java` under each POM and Surefire's conventional
 `Test*.java`, `*Test.java`, `*Tests.java`, and `*TestCase.java` names. Class names
@@ -112,18 +152,48 @@ testExcludes = ["**/AbstractSpec.java"]
 ```
 
 These settings only control discovery; configure the corresponding source
-directory in your POM too. This first version does not interpret effective POMs,
+directory in your POM too. This version does not interpret effective POMs,
 active profiles, annotations, generated tests, or other JVM source languages.
 A candidate can therefore be a helper or belong to an inactive module; its
-explicit run fails if it produces no test cases. Individual methods and runtime
-parameter values are not separate collection items.
+check fails as not run. Discovery filters never hide a failure: every test Maven
+runs is attributed to a class check, its module's checks, or verify.
 
-Class selection requires modern Surefire (tested with 3.5.4), standard XML
-reports under `target/surefire-reports`, and class-based test execution. JUnit 4
-and JUnit 5 are covered by the integration suite. Custom TestNG suite files,
+Listing (`dagger check -l`, `dagger list`) reads workspace files only: it runs
+no container and no Maven command, so broken POMs and unresolvable
+dependencies still list. A reactor root without a `pom.xml` lists no modules;
+its verify check fails alone.
+
+Class checks require modern Surefire (tested with 3.5.4), standard XML reports
+under `target/surefire-reports`, and class-based test execution. JUnit 4 and
+JUnit 5 are covered by the integration suite. Custom TestNG suite files,
 hard-coded plugin `<test>` selectors, and custom report layouts are outside
-this initial support. Use `project.test(..., args: [...])` or `run` for those
+this support. Use `project.test(..., args: [...])` or `run` for those
 workflows, method selectors, and Failsafe integration-test selection.
+
+From another Dang module, the collection helpers `MavenModules.test`,
+`MavenTests.test`, and `MavenProjects.verify` are plain functions, not checks,
+so `dagger check` never reports the same failure twice. They run through the
+same shared command and fail with every failure of their selection, whoever
+owns it. There is no `.batch` namespace. An empty subset does not run Maven.
+
+Earlier versions used a flat `tests` collection keyed `app/example.AppTest`,
+with `batch.test` returning a container, and a `verify` that reported every
+failure. Callers now write:
+
+| Before | Now |
+| --- | --- |
+| `project.tests(ws)` | `project.modules(ws).get(key: "app").tests` |
+| `tests.get(key: "app/example.AppTest").test(ws)` | `tests.subset(keys: ["example.AppTest"]).test(ws)` |
+| `classes.subset(keys: [...]).batch.test(ws)` | `tests.subset(keys: [...]).test(ws)`, per module |
+| `projects.batch.verify(ws)` | `projects.verify(ws)`, raising on failure |
+| `project.verify(ws).pass` for the complete verdict | `maven.projects(ws).subset(keys: [path]).verify(ws)` |
+
+Selection helpers return nothing; use `reports` or `run` for report files.
+
+```dang
+let app = maven.project(".").modules(ws).get(key: "app")
+app.tests.subset(keys: ["example.AppTest", "example.SecondTest"]).test(ws)
+```
 
 ## Operations
 
@@ -132,13 +202,13 @@ workflows, method selectors, and Failsafe integration-test selection.
 | `compile` | `compile` | Container with compiled production code |
 | `test` | `test` | Container with unit test results |
 | `build` | `package` | All `target` trees, with module-relative paths |
-| `verify` | `verify` | Dagger check; the only automatic check |
+| `verify` | `verify` | Dagger check for failures no class check owns |
 | `reports` | `verify`, ignoring test failures | Surefire and Failsafe report trees |
 | `install` | `install` | Container with artifacts installed in its local repository |
 | `deploy` | `deploy` | Output from publishing to the configured repository |
 | `run` | Caller-supplied phases/goals | Container for custom workflows |
 | `container` | None | Prepared container for customization or debugging |
-| `tests` | None | Discover a selectable collection of Java unit-test classes |
+| `modules` | None | Module collection, each with its test class checks |
 
 `build` runs unit tests by default. For a reactor with `library` and `app`, its
 output includes `library/target/…` and `app/target/…`. It preserves JARs, WARs,
@@ -147,13 +217,13 @@ directories are available through `run(...).directory(...)`.
 
 `reports` returns XML and text reports even when tests fail, using
 `-Dmaven.test.failure.ignore=true`. Compilation and other build errors still
-fail. Report export is separate from the CI verdict: always run `verify` too.
+fail. Report export is separate from the CI verdict: always run `dagger check` too.
 Custom report directories are available through `run`.
 
 `run` supports `clean`, `dependency:tree`, `dependency:go-offline`, `site`,
 plugin goals, and other Maven commands without adding a helper for each one.
 Project-level execution methods other than `verify` accept additional `args`.
-Configure module-level `args` to affect checks and class-collection runs too.
+Configure module-level `args` to affect checks and class runs too.
 
 ## Toolchain and settings
 
@@ -232,12 +302,9 @@ publish(ws: Workspace!, settings: Secret!): String! {
   maven(settings: settings).project("services/api").deploy(ws)
 }
 
+# Verify every reactor and fail with every failing project, tests included.
 check(ws: Workspace!): Void {
-  let result = maven.projects(ws).batch.verify(ws)
-  if (result.pass == false) {
-    raise result.error.message ?? "Maven verification failed"
-  }
-  null
+  maven.projects(ws).verify(ws)
 }
 ```
 
@@ -260,6 +327,19 @@ a disposable `file://` repository. It never publishes to a remote repository.
 Class-collection checks cover discovery, custom source paths, selections across
 modules, duplicate class names, empty subsets, failure propagation, and JUnit 5
 parameterized and nested tests.
+
+The `selected-*` checks run `dagger check` through the engine-provided,
+version-matched CLI in an isolated session against generated fixtures, because
+direct Dang calls do not apply the engine's filtered collection view. They
+cover two reactors with two modules each, excluded classes not running, an
+isolated class failure, a compilation failure blamed on its module, failures
+outside any selected class (narrowed, and owned by verify in a whole run), a
+selected class that never ran, the whole-reactor run, one Maven command per
+reactor, and listing that runs no container:
+
+```sh
+dagger check 'selected-*'
+```
 The shared workspace configuration, test module, and `dagger.lock` live at the
 repository root. Commit that lockfile to retain the SDK and image resolutions
 used by the suite.

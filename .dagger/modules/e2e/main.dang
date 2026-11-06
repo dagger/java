@@ -61,6 +61,21 @@ type E2e {
       """)
   }
 
+  # The complete verdict of every reactor, through the plain collection helper.
+  let verified(tool: Maven!, ws: Workspace!): String! {
+    { tool.projects(ws).verify(ws); "passed" } rescue {
+      err: Error => err.message
+    }
+  }
+
+  # Module and class keys, one "module class" string per test class.
+  let classKeys(modules: MavenModules!): [String!]! {
+    let empty: [String!]! = []
+    modules.keys.reduce(empty) { keys, module =>
+      keys + modules.get(key: module).tests.keys.map { name => module + " " + name }
+    }
+  }
+
   """
   Class discovery follows conventional Java paths and configurable filename patterns.
   """
@@ -80,18 +95,26 @@ type E2e {
       .withNewFile("app/target/generated-test-sources/GeneratedTest.java", "// generated")
     let project = maven.project(".")
     let expected = [
-      "./TestDefault", "app/example.AppTest", "app/example.AppTestCase",
-      "app/example.AppTests", "app/example.TestApp", "app/example.TestBothTest",
+      ". TestDefault", "app example.AppTest", "app example.AppTestCase",
+      "app example.AppTests", "app example.TestApp", "app example.TestBothTest",
     ]
-    assert(project.tests(source.asWorkspace).keys == expected, "incorrect conventional test class discovery")
+    assert(project.modules(source.asWorkspace).keys == [".", "app"], "incorrect module discovery")
+    assert(classKeys(project.modules(source.asWorkspace)) == expected, "incorrect conventional test class discovery")
     assert(
-      project.tests(source.asWorkspace(cwd: "/app/src/test/java")).keys == expected,
+      classKeys(project.modules(source.asWorkspace(cwd: "/app/src/test/java"))) == expected,
       "class keys changed with workspace cwd",
     )
     let nested = directory.withDirectory("nested/reactor", source).asWorkspace
-    assert(maven.project("nested/reactor").tests(nested).keys == expected, "class keys were not reactor relative")
     assert(
-      maven.project(".").tests(directory.withNewFile("pom.xml", "<project/>").asWorkspace).keys.isEmpty,
+      classKeys(maven.project("nested/reactor").modules(nested)) == expected
+        .map { key => "nested/reactor/" + key }
+        .map { key => key.replace(old: "nested/reactor/. ", new: "nested/reactor ") },
+      "module keys were not workspace relative",
+    )
+    assert(
+      classKeys(
+        maven.project(".").modules(directory.withNewFile("pom.xml", "<project/>").asWorkspace),
+      ).isEmpty,
       "invented test classes",
     )
     let custom = source
@@ -104,50 +127,35 @@ type E2e {
       testExcludes: ["**/ExcludedSpec.java"],
     )
     assert(
-      tool.project(".").tests(custom.asWorkspace).keys == ["app/example.FeatureSpec"],
+      classKeys(tool.project(".").modules(custom.asWorkspace)) == ["app example.FeatureSpec"],
       "custom discovery patterns failed",
     )
-    let selected = project.tests(source.asWorkspace).get(key: "app/example.AppTest")
-    assert(
-      selected.module == "app" and selected.className == "example.AppTest",
-      "incorrect class metadata",
-    )
+    let selected = project.modules(source.asWorkspace).get(key: "app").tests.get(key: "example.AppTest")
+    assert(selected.module == "app" and selected.name == "example.AppTest", "incorrect class metadata")
     null
   }
 
   """
-  Run a class or subset once, without running unselected classes in any module.
+  Run a class subset once, without running unselected classes in any module.
+  Selected tests ignore -Dtest from module arguments.
   """
   testClassSelection(ws: Workspace!): Void @check {
-    # A nested reactor also exercises mapping reactor-relative keys to workspace POMs.
+    # A nested reactor also exercises mapping workspace keys to module POMs.
+    # Unselected failing classes, the dependency's same-named class, and POM
+    # includes that would run AppIT all fail the helper if they escape.
     let source = directory.withDirectory("nested/reactor", classFixture(ws)).asWorkspace
     let project = maven(cacheKey: "maven-e2e-class-selection", args: ["-Dtest=example.OtherTest"]).project("nested/reactor")
-    let classes = project.tests(source)
-    let one = classes.get(key: "app/example.AppTest").test(source)
-    one.file("app/target/surefire-reports/TEST-example.AppTest.xml").sync
-    assert(
-      one.directory(".").glob("library/target/surefire-reports/TEST-*.xml").isEmpty,
-      "ran the dependency's identically named test",
-    )
-    assert(
-      one.directory(".").glob("app/target/surefire-reports/TEST-example.OtherTest.xml").isEmpty,
-      "ran an unselected failing class",
-    )
-    assert(
-      one.directory(".").glob("app/target/surefire-reports/TEST-example.AppIT.xml").isEmpty,
-      "POM includes escaped the class selection",
-    )
-    let batch = classes.subset(keys: ["app/example.AppTest", "app/example.SecondTest", "library/example.LibraryTest"]).batch.test(source)
-    batch.file("app/target/surefire-reports/TEST-example.AppTest.xml").sync
-    batch.file("app/target/surefire-reports/TEST-example.SecondTest.xml").sync
-    batch.file("library/target/surefire-reports/TEST-example.LibraryTest.xml").sync
-    assert(
-      batch.directory(".").glob("library/target/surefire-reports/TEST-example.AppTest.xml").isEmpty,
-      "batch ran the dependency's unselected duplicate",
-    )
-    assert(batch.stdout.split("BUILD SUCCESS").length == 2, "the subset ran more than one Maven invocation")
-    let empty = classes.subset(keys: []).batch.test(source)
-    assert(empty.directory(".").glob("**/target/**").isEmpty, "an empty subset executed Maven")
+    let modules = project.modules(source)
+    modules.get(key: "nested/reactor/app").tests.subset(keys: ["example.AppTest", "example.SecondTest"]).test(source)
+    modules.get(key: "nested/reactor/library").tests.subset(keys: ["example.LibraryTest"]).test(source)
+    modules.get(key: "nested/reactor/app").tests.subset(keys: []).test(source)
+    let failed = {
+      modules.get(key: "nested/reactor/app").tests.subset(keys: ["example.OtherTest"]).test(source)
+      "passed"
+    } rescue {
+      err: Error => err.message
+    }
+    assert(failed.contains("unselected class must not run"), "a failing class did not fail its helper: " + failed)
     null
   }
 
@@ -178,12 +186,12 @@ type E2e {
         public class ExampleSpec {
           @org.junit.jupiter.params.ParameterizedTest
           @org.junit.jupiter.params.provider.ValueSource(strings = {"a", "b"})
-          void parameterized(String value) { org.junit.jupiter.api.Assertions.assertEquals(1, value.length()); }
+          void parameterized(String value) { org.junit.jupiter.api.Assertions.assertEquals("a", value, "parameterized sentinel"); }
 
           @org.junit.jupiter.api.Nested
           class NestedTests {
             @org.junit.jupiter.api.Test
-            void nested() { org.junit.jupiter.api.Assertions.assertTrue(true); }
+            void nested() { org.junit.jupiter.api.Assertions.fail("nested sentinel"); }
           }
         }
       """)
@@ -200,44 +208,55 @@ type E2e {
       testSourceDirectory: "src/spec/java",
       testIncludes: ["**/*Spec.java"],
     ).project(".")
-    let result = project.tests(source).get(key: "./example.ExampleSpec").test(source)
-    let reports = result.directory("target/surefire-reports")
-    let xml = reports.glob("TEST-*.xml").map { file => reports.file(file).contents }.join("\n")
-    assert(xml.contains("classname=\"example.ExampleSpec\""), "parameterized cases did not run")
-    assert(xml.contains("classname=\"example.ExampleSpec$NestedTests\""), "nested tests did not run")
-    assert(reports.glob("TEST-example.UnselectedSpec.xml").isEmpty, "ran an unselected JUnit 5 class")
+    # Sentinel failures prove that parameterized and nested cases ran and that
+    # both are attributed to the outer class.
+    let result = {
+      project.modules(source).get(key: ".").tests.subset(keys: ["example.ExampleSpec"]).test(source)
+      "passed"
+    } rescue {
+      err: Error => err.message
+    }
+    assert(result.contains("parameterized sentinel"), "parameterized cases did not run: " + result)
+    assert(result.contains("nested sentinel"), "nested tests did not run: " + result)
+    assert(result.contains("unselected JUnit 5 test ran") == false, "ran an unselected JUnit 5 class")
+    assert(result.contains("without selected test checks") == false, "nested results were not attributed: " + result)
     null
   }
 
   """
-  Selected failures propagate, and skipped or unknown classes cannot silently pass.
+  Selected failures propagate, and skipped classes cannot silently pass.
   """
   testClassFailures(ws: Workspace!): Void @check {
     let source = classFixture(ws).asWorkspace
-    let project = maven(cacheKey: "maven-e2e-class-failures", args: ["-Dmaven.test.failure.ignore=true"]).project(".")
-    let failed = { project.tests(source).get(key: "app/example.OtherTest").test(source).sync; "passed" } rescue {
+    let tests = maven(cacheKey: "maven-e2e-class-failures", args: ["-Dmaven.test.failure.ignore=true"])
+      .project(".")
+      .modules(source)
+      .get(key: "app")
+      .tests
+    let failed = { tests.subset(keys: ["example.OtherTest"]).test(source); "passed" } rescue {
       err: Error => err.message
     }
     assert(failed != "passed", "a selected failing class passed")
-    let unknown = { project.tests(source).get(key: "app/example.UnknownTest").test(source).sync; "passed" } rescue {
+    let unknown = { tests.subset(keys: ["example.UnknownTest"]).test(source); "passed" } rescue {
       err: Error => err.message
     }
     assert(unknown != "passed", "an unknown class passed")
     let skipped = {
       maven(cacheKey: "maven-e2e-class-failures", args: ["-DskipTests"])
         .project(".")
-        .tests(source)
-        .get(key: "app/example.AppTest")
+        .modules(source)
+        .get(key: "app")
+        .tests
+        .subset(keys: ["example.AppTest"])
         .test(source)
-        .sync
       "passed"
     } rescue {
       err: Error => err.message
     }
-    assert(skipped.contains("no test cases ran"), "a skipped class silently passed: " + skipped)
+    assert(skipped.contains("did not run"), "a skipped class silently passed: " + skipped)
     # Full verify must still run classes omitted from discovery.
     let hidden = maven(cacheKey: "maven-e2e-class-failures", testExcludes: ["**/OtherTest.java", "**/AppTest.java"])
-    assert(hidden.project(".").verify(source).pass == false, "discovery filters weakened the full verify check")
+    assert(verified(hidden, source) != "passed", "discovery filters weakened the complete verify verdict")
     null
   }
 
@@ -380,7 +399,7 @@ type E2e {
   }
 
   """
-  Failures propagate from both Surefire and Failsafe, including batch checks.
+  Failures propagate from both Surefire and Failsafe, including collection verify.
   """
   failures(ws: Workspace!): Void @check {
     let source = fixture(ws)
@@ -400,8 +419,12 @@ type E2e {
       """,
     ).asWorkspace
     let tool = maven(cacheKey: "maven-e2e-failures")
-    assert(tool.project(".").verify(badUnit).pass == false, "unit test failure passed verify")
-    assert(tool.project(".").verify(badIntegration).pass == false, "integration failure passed verify")
+    assert(verified(tool, badUnit) != "passed", "unit test failure passed verify")
+    assert(verified(tool, badIntegration) != "passed", "integration failure passed verify")
+    # app/example.AppTest's check owns both failures, so the reactor's own
+    # verify check does not report them a second time.
+    assert(tool.project(".").verify(badUnit).pass, "verify also failed for a unit test its class check owns")
+    assert(tool.project(".").verify(badIntegration).pass, "verify also failed for a failure class checks own")
     assert(
       tool.project(".").reports(badUnit).file("app/target/surefire-reports/TEST-example.AppTest.xml").contents.contains("failures=\"1\""),
       "could not export reports from failing unit tests",
@@ -410,16 +433,17 @@ type E2e {
       tool.project(".").reports(badIntegration).file("app/target/failsafe-reports/TEST-example.AppIT.xml").contents.contains("failures=\"1\""),
       "could not export reports from failing integration tests",
     )
-    let batch = directory
+    let reactors = directory
       .withDirectory("bad-unit", source.withDirectory(".", badUnit.directory("/")))
       .withDirectory("bad-integration", badIntegration.directory("/"))
       .asWorkspace
-    let check = tool.projects(batch).batch.verify(batch)
-    assert(check.pass == false, "failing reactors passed batch verify")
-    let message = check.error.message ?? ""
+    let message = { tool.projects(reactors).verify(reactors); "passed" } rescue {
+      err: Error => err.message
+    }
+    assert(message != "passed", "failing reactors passed collection verify")
     assert(
       message.contains("- bad-unit:") and message.contains("- bad-integration:"),
-      "batch did not report both reactors: " + message,
+      "collection verify did not report both reactors: " + message,
     )
     null
   }
@@ -453,6 +477,322 @@ type E2e {
     installed.withExec(["test", "-f", "/maven/repository/io/dagger/maven/fixture/app/1.0-SNAPSHOT/app-1.0-SNAPSHOT.jar"]).sync
     let output = project.deploy(source, args: ["-DaltDeploymentRepository=fixture::file:///tmp/deployed"])
     assert(output.contains("BUILD SUCCESS"), "file repository deployment did not succeed")
+    null
+  }
+
+  # Only the unindented CHECKS header counts; test summaries can be nested.
+  let checkSummaryMatches(output: String!, passed: Int!, failed: Int!): Boolean! {
+    let headers = output.split("\n").filter { line =>
+      line.hasPrefix("CHECKS ") or line.hasPrefix("== CHECKS ==")
+    }
+    # Counts are bound first: dang fmt v2.1.4 mangles an interpolation that
+    # follows a non-ASCII string in a list literal.
+    let failedCount = `${failed}`
+    let passedCount = `${passed}`
+    let expected = (if (failed > 0) { ["✘", failedCount, "failed"] } else { [] })
+      + (if (passed > 0) { ["✔", passedCount, "passed"] } else { [] })
+    headers.length == 1 and headers[0]!
+      .trimPrefix("== ")
+      .trimPrefix("CHECKS")
+      .trimPrefix(" ==")
+      .trimSpace
+      .split(" ")
+      .filter { word => word != "" } == expected
+  }
+
+  """
+  The check-summary parser counts only the top-level CHECKS header.
+  """
+  selectedSummaryCheck: Void @check {
+    assert(
+      checkSummaryMatches("== CHECKS ==  ✘ 3 failed  ✔ 3 passed\n", 3, 3),
+      "mixed counts were not recognized",
+    )
+    assert(checkSummaryMatches("== CHECKS ==  ✔ 6 passed\n", 6, 0), "passing counts were not recognized")
+    assert(
+      checkSummaryMatches("== CHECKS ==  ✔ 16 passed\n", 6, 0) == false,
+      "accepted a partial count",
+    )
+    assert(checkSummaryMatches("  CHECKS  ✔ 6 passed\n", 6, 0) == false, "accepted a nested header")
+    null
+  }
+
+  # Run dagger check through the engine-provided, version-matched CLI in an
+  # isolated session: direct Dang calls do not apply the engine's filtered
+  # collection view, so only this exercises what selected checks receive.
+  let selectedRun(ws: Workspace!, fixture: Directory!, args: [String!]!): Container! {
+    container
+      .from("alpine:3.23")
+      .withEnvVariable("NO_COLOR", "1")
+      .withDirectory("/source", ws.directory("/maven", exclude: ["**/target/**"]))
+      .withDirectory("/work", fixture)
+      .withNewFile("/work/.git/HEAD", "ref: refs/heads/main\n")
+      .withNewFile("/work/dagger.toml", "[modules.maven]\nsource = \"/source\"\n")
+      .withWorkdir("/work")
+      .withExec(
+        ["/dev/.dagger/dagger", "check", "--generated=false"] + args,
+        expect: ANY,
+        daggerInDaggerNewSession: true,
+      )
+  }
+
+  let selectedCheck(
+    ws: Workspace!,
+    fixture: Directory!,
+    args: [String!]!,
+    passed: Int!,
+    failed: Int! = 0,
+    messages: [String!]! = [],
+  ): Void {
+    let result = selectedRun(ws, fixture, ["--progress=report"] + args)
+    let output = result.stdout + result.stderr
+    assert((result.exitCode == 0) == (failed == 0), "unexpected check exit status:\n" + output)
+    assert(checkSummaryMatches(output, passed, failed), "unexpected Dagger check totals:\n" + output)
+    messages.map { message =>
+      assert(output.contains(message), "missing " + message + ":\n" + output)
+    }
+    null
+  }
+
+  let javaClass(name: String!, body: String!): String! {
+    "package example;\npublic class " + name + " {\n  @org.junit.Test public void run() { " + body + " }\n}\n"
+  }
+
+  # Two reactors, each with two modules. Every selected class passes.
+  let passingFixture(ws: Workspace!): Directory! {
+    let reactor = fixture(ws)
+    let withLibraryTests = reactor
+      .withNewFile(
+        "library/pom.xml",
+        reactor.file("library/pom.xml").contents.replace(
+          old: "</project>",
+          new: "<dependencies><dependency><groupId>junit</groupId><artifactId>junit</artifactId></dependency></dependencies></project>",
+        ),
+      )
+      .withNewFile("app/src/test/java/example/SecondTest.java", javaClass(
+        "SecondTest",
+        "org.junit.Assert.assertEquals(\"hello\", Greeting.message());",
+      ))
+      .withNewFile("library/src/test/java/example/LibraryTest.java", javaClass(
+        "LibraryTest",
+        "org.junit.Assert.assertEquals(\"hello\", Greeting.message());",
+      ))
+    directory.withDirectory("one", withLibraryTests).withDirectory("two", withLibraryTests)
+  }
+
+  # Unselected classes fail if they run, in both modules of both reactors.
+  let selectionFixture(ws: Workspace!): Directory! {
+    ["one/app", "one/library", "two/app", "two/library"].reduce(passingFixture(ws)) { files, module =>
+      files.withNewFile(
+        module + "/src/test/java/example/OtherTest.java",
+        javaClass("OtherTest", "org.junit.Assert.fail(\"excluded test ran\");"),
+      )
+    }
+  }
+
+  let selectionArgs: [String!]! {
+    ["one/app", "one/library", "two/app", "two/library"].map { module => "--maven-module=" + module }
+      + ["example.AppTest", "example.SecondTest", "example.LibraryTest"].map { name => "--maven-test=" + name }
+  }
+
+  """
+  Selected classes across reactors and modules pass; excluded classes do not run.
+  """
+  selectedTestsCheck(ws: Workspace!): Void @check {
+    selectedCheck(ws, selectionFixture(ws), selectionArgs, passed: 6)
+  }
+
+  """
+  An unselected run checks every class and verifies each reactor.
+  """
+  selectedWholeCheck(ws: Workspace!): Void @check {
+    selectedCheck(ws, passingFixture(ws), [], passed: 8)
+  }
+
+  """
+  A failing selected class fails only its own check.
+  """
+  selectedFailureCheck(ws: Workspace!): Void @check {
+    let fixture = selectionFixture(ws)
+      .withNewFile("one/app/src/test/java/example/AppTest.java", javaClass(
+        "AppTest",
+        "org.junit.Assert.fail(\"selected failure\");",
+      ))
+    selectedCheck(
+      ws,
+      fixture,
+      selectionArgs,
+      passed: 5,
+      failed: 1,
+      messages: ["maven-module=one/app&maven-test=example.AppTest", "selected failure"],
+    )
+  }
+
+  """
+  A compilation failure fails its module's classes; dependents did not run.
+  """
+  selectedBuildFailureCheck(ws: Workspace!): Void @check {
+    let fixture = selectionFixture(ws)
+      .withNewFile("two/library/src/main/java/example/Broken.java", "package example;\nclass Broken { int x = undefinedSymbol; }\n")
+    selectedCheck(
+      ws,
+      fixture,
+      selectionArgs,
+      passed: 3,
+      failed: 3,
+      messages: [
+        "Maven tests in two/library: Maven failed in module two/library",
+        "COMPILATION ERROR",
+        "example.SecondTest did not run",
+        "Maven stopped building it after failures in: two/library",
+      ],
+    )
+  }
+
+  """
+  A failing class without a check fails its module's checks, not verify too.
+  """
+  selectedUncheckedFailureCheck(ws: Workspace!): Void @check {
+    let fixture = directory.withDirectory(
+      "reporting",
+      fixture(ws).withNewFile("app/src/test/java/example/AppIT.java", javaClass(
+        "AppIT",
+        "org.junit.Assert.fail(\"integration sentinel\");",
+      )),
+    )
+    selectedCheck(
+      ws,
+      fixture,
+      [],
+      passed: 1,
+      failed: 1,
+      messages: [
+        "maven-module=reporting/app&maven-test=example.AppTest",
+        "failures in test classes without selected test checks: reporting/app/example.AppIT",
+        "integration sentinel",
+      ],
+    )
+  }
+
+  """
+  A selected class that Surefire never runs fails rather than passing.
+  """
+  selectedNotRunCheck(ws: Workspace!): Void @check {
+    let fixture = selectionFixture(ws).withNewFile(
+      "one/app/src/test/java/example/AbstractTest.java",
+      "package example;\npublic abstract class AbstractTest {\n  @org.junit.Test public void run() {}\n}\n",
+    )
+    selectedCheck(
+      ws,
+      fixture,
+      selectionArgs + ["--maven-test=example.AbstractTest"],
+      passed: 6,
+      failed: 1,
+      messages: ["example.AbstractTest did not run"],
+    )
+  }
+
+  """
+  Selected checks share one Maven command per reactor.
+  """
+  selectedDedupCheck(ws: Workspace!): Void @check {
+    # The inner session evaluates every check afresh, and its progress shows
+    # each distinct Maven command once, whether it ran or came from the cache.
+    let result = selectedRun(ws, selectionFixture(ws), ["--progress=plain", "-vvv"] + selectionArgs)
+    let output = result.stdout + result.stderr
+    assert(result.exitCode == 0, "selected checks failed:\n" + output)
+    let runs = output.split("\n").filter { line => line.contains("withExec mvn ") }
+    assert(runs.length == 2, "expected one Maven command per reactor, got " + `${runs.length}` + ":\n" + runs.join("\n"))
+    null
+  }
+
+  # Reactor two gains a module without test classes that fails to compile.
+  # Nothing depends on it, so --fail-at-end still builds every other module.
+  let brokenExtra(fixture: Directory!): Directory! {
+    fixture
+      .withNewFile(
+        "two/pom.xml",
+        fixture.file("two/pom.xml").contents.replace(
+          old: "<module>app</module>",
+          new: "<module>app</module><module>extra</module>",
+        ),
+      )
+      .withNewFile(
+        "two/extra/pom.xml",
+        "<project xmlns=\"http://maven.apache.org/POM/4.0.0\"><modelVersion>4.0.0</modelVersion><parent><groupId>io.dagger.maven.fixture</groupId><artifactId>reactor</artifactId><version>1.0-SNAPSHOT</version></parent><artifactId>extra</artifactId></project>\n",
+      )
+      .withNewFile("two/extra/src/main/java/example/Extra.java", "package example;\nclass Extra { int x = undefinedSymbol; }\n")
+  }
+
+  """
+  A failing module blames only its own classes; other modules pass on their own.
+  """
+  selectedModuleFailureCheck(ws: Workspace!): Void @check {
+    # Broken.java is not a test class candidate, so only the module can own it.
+    let fixture = selectionFixture(ws)
+      .withNewFile("two/app/src/test/java/example/Broken.java", "package example;\nclass Broken { int x = undefinedSymbol; }\n")
+    selectedCheck(
+      ws,
+      fixture,
+      selectionArgs,
+      passed: 4,
+      failed: 2,
+      messages: ["Maven tests in two/app: Maven failed in module two/app", "maven-module=two/app&maven-test=example.SecondTest"],
+    )
+  }
+
+  """
+  In a narrowed run, a failure in a module without selected classes fails every
+  selected class sharing the command: no verify check is there to own it.
+  """
+  selectedOutsideFailureCheck(ws: Workspace!): Void @check {
+    selectedCheck(
+      ws,
+      brokenExtra(selectionFixture(ws)),
+      selectionArgs,
+      passed: 3,
+      failed: 3,
+      messages: ["Maven failed in modules without selected test checks: two/extra"],
+    )
+  }
+
+  """
+  In a whole run, verify alone owns a failure in a module without test classes.
+  """
+  selectedVerifyOwnsCheck(ws: Workspace!): Void @check {
+    selectedCheck(
+      ws,
+      brokenExtra(passingFixture(ws)),
+      [],
+      passed: 7,
+      failed: 1,
+      messages: ["dag://?check=verify&maven-project=two", "Maven failed in modules without selected test checks: two/extra"],
+    )
+  }
+
+  """
+  Listing discovers classes from workspace files alone: it runs no container,
+  so broken POMs and unresolvable dependencies still list.
+  """
+  selectedListCheck(ws: Workspace!): Void @check {
+    let base = passingFixture(ws)
+    let fixture = base
+      .withNewFile("two/library/pom.xml", "<project><unclosed>")
+      .withNewFile(
+        "two/app/pom.xml",
+        base.file("two/app/pom.xml").contents.replace(
+          old: "<dependencies>",
+          new: "<dependencies><dependency><groupId>io.dagger.missing</groupId><artifactId>missing</artifactId><version>0</version></dependency>",
+        ),
+      )
+    let result = selectedRun(ws, fixture, ["-l", "--all", "--progress=plain", "-vvv"])
+    let output = result.stdout + result.stderr
+    assert(result.exitCode == 0, "listing failed:\n" + output)
+    ["one/app", "two/app", "two/library", "example.SecondTest", "example.LibraryTest"].map { key =>
+      assert(output.contains(key), "listing lost " + key + ":\n" + output)
+    }
+    let execs = output.split("\n").filter { line => line.contains("withExec") }
+    assert(execs.isEmpty, "listing ran a container:\n" + execs.join("\n"))
     null
   }
 }
