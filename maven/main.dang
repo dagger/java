@@ -126,11 +126,7 @@ type Maven {
         path,
       )
     }
-    let empty: [String!]! = []
-    let sorted = selected.reduce(empty) { acc, path =>
-      acc.takeWhile { item => item <= path } + [path] + acc.dropWhile { item => item <= path }
-    }
-    MavenProjects(paths: sorted, tool: self)
+    MavenProjects(paths: sorted(selected), tool: self)
   }
 
   """
@@ -150,6 +146,49 @@ type Maven {
 
   let image: Container! {
     base ?? container.from("maven:" + mavenVersion + "-eclipse-temurin-" + javaVersion)
+  }
+
+  # Byte-order sort: a merge sort, n log n comparisons. Result ranks depend on
+  # every caller sorting identically, so all test selections use this.
+  let sorted(items: [String!]!): [String!]! {
+    if (items.length < 2) {
+      items
+    } else {
+      let half = items.length / 2
+      mergeSorted(sorted(items.takeFirst(half)), sorted(items.dropFirst(half)))
+    }
+  }
+
+  let mergeSorted(a: [String!]!, b: [String!]!): [String!]! {
+    let i = 0
+    let j = 0
+    (a + b).map { unused =>
+      if (j == b.length or (i < a.length and a[i]! <= b[j]!)) {
+        let item = a[i]!
+        i += 1
+        item
+      } else {
+        let item = b[j]!
+        j += 1
+        item
+      }
+    }
+  }
+
+  # The report indexer runs in this pinned image, independent of base and of
+  # the configured Java and Maven versions, so it is built once per engine.
+  let reportImage: Container! {
+    container.from("maven:3.9.16-eclipse-temurin-21").withoutEntrypoint
+  }
+
+  let reportIndexer: Directory! {
+    reportImage
+      .withFile(
+        "/helpers/MavenTestReport.java",
+        currentModule.source.file("helpers/maven-test-report/MavenTestReport.java"),
+      )
+      .withExec(["javac", "-d", "/maven-test-report", "/helpers/MavenTestReport.java"])
+      .directory("/maven-test-report")
   }
 }
 
@@ -172,9 +211,11 @@ type MavenProjects @collection {
   }
 
   """
-  Verify every selected reactor and report every failing project.
+  Verify every reactor in this collection and report every failing project,
+  including test class failures. A plain function, not a check: dagger check
+  reports the same failures through each reactor's test class and verify checks.
   """
-  verify(ws: Workspace!): Void @check {
+  verify(ws: Workspace!): Void {
     let failures = paths.map { path => project(path) }.{{path, failure: verifyFailure(ws)}}
       .filter { result => result.failure != null }
     if (failures.isEmpty == false) {
@@ -274,8 +315,8 @@ type MavenProject {
     run(ws, ["test"], args)
   }
 
-  # POM directories below this reactor, relative to its root. Maven, rather
-  # than discovery, decides which of them belong to the active reactor.
+  # POM directories below a directory, relative to it. Maven, rather than
+  # discovery, decides which of them belong to the active reactor.
   let pomDirectories(source: Directory!): [String!]! {
     source.glob("**/pom.xml").map { file =>
       let parent = file.split("/").dropLast(1).join("/")
@@ -287,103 +328,191 @@ type MavenProject {
     if (module == ".") { name } else { module + "/" + name }
   }
 
-  """
-  Java unit-test class candidates, keyed by reactor-relative module directory
-  and fully qualified class name, e.g. app/example.AppTest. Listing runs no
-  Maven command. Names are inferred from paths beneath testSourceDirectory.
-  Class operations are explicit, leaving verify as the only automatic check.
-  """
-  tests(ws: Workspace!): MavenTestClasses! {
-    let source = tool.source(ws).directory(path)
-    if (source.glob("pom.xml").isEmpty) {
-      raise "no pom.xml at Maven project root: " + path
-    }
-    let testDir = tool.relativePath(tool.testSourceDirectory)
-    let empty: [String!]! = []
-    let names = pomDirectories(source).reduce(empty) { names, module =>
-      let testPath = modulePath(module, testDir)
-      let prefix = if (testPath == ".") { "" } else { testPath + "/" }
-      let excluded = tool.testExcludes.reduce(empty) { files, pattern => files + source.glob(prefix + pattern) }
-      let included = tool.testIncludes.reduce(empty) { files, pattern => files + source.glob(prefix + pattern) }
-      names + included
-        .uniq
-        .reject { file => excluded.contains(file) }
-        .filter { file => file.hasSuffix(".java") }
-        .map { file =>
-          file.trimPrefix(prefix).trimSuffix(".java").replace(
-            old: "/",
-            new: ".",
-          )
-        }
-        # Ignore package-info/module-info and paths that cannot name a Java class.
-        .filter { name =>
-          name.replaceMatches(
-            `^[\p{L}_$][\p{L}\p{N}_$]*(\.[\p{L}_$][\p{L}\p{N}_$]*)*$`,
-            with: "",
-          ) == ""
-        }
-        .map { name => module + "/" + name }
-    }
-    let sorted = names.uniq.reduce(empty) { acc, name =>
-      acc.takeWhile { item => item <= name } + [name] + acc.dropWhile { item => item <= name }
-    }
-    MavenTestClasses(names: sorted, project: self)
+  # A reactor-relative module directory as a workspace-relative one.
+  let workspacePath(module: String!): String! {
+    if (module == ".") { path } else { subpath(module) }
   }
 
-  # Use project-relative selection files so two modules can have the same
+  # Java unit-test class candidates in one module directory, by fully
+  # qualified name, inferred from paths beneath testSourceDirectory.
+  let testClasses(source: Directory!, module: String!): [String!]! {
+    let empty: [String!]! = []
+    let testPath = modulePath(module, tool.relativePath(tool.testSourceDirectory))
+    let prefix = if (testPath == ".") { "" } else { testPath + "/" }
+    let excluded = tool.testExcludes.reduce(empty) { files, pattern => files + source.glob(prefix + pattern) }
+    let included = tool.testIncludes.reduce(empty) { files, pattern => files + source.glob(prefix + pattern) }
+    let names = included
+      .uniq
+      .reject { file => excluded.contains(file) }
+      .filter { file => file.hasSuffix(".java") }
+      .map { file =>
+        file.trimPrefix(prefix).trimSuffix(".java").replace(
+          old: "/",
+          new: ".",
+        )
+      }
+      # Ignore package-info/module-info and paths that cannot name a Java class.
+      .filter { name =>
+        name.replaceMatches(
+          `^[\p{L}_$][\p{L}\p{N}_$]*(\.[\p{L}_$][\p{L}\p{N}_$]*)*$`,
+          with: "",
+        ) == ""
+      }
+    tool.sorted(names.uniq)
+  }
+
+  """
+  POM directories at or below this reactor root, keyed by workspace-relative
+  directory, e.g. app or services/api/app. Each module's tests collection holds
+  its Java unit-test class candidates. Discovery reads only workspace globs:
+  listing runs no container and no Maven command.
+  """
+  modules(ws: Workspace!): MavenModules! {
+    # A root without a POM lists no modules rather than failing discovery for
+    # every project; its verify check reports the missing POM alone.
+    let source = tool.source(ws).directory(path)
+    let modules = pomDirectories(source).uniq
+    let dirs = tool.sorted(modules.map { module => workspacePath(module) })
+    MavenModules(
+      paths: dirs,
+      project: self,
+      entries: tool.sorted(modules).map { module =>
+        let dir = workspacePath(module)
+        MavenModuleSelection(
+          directory: dir,
+          tests: MavenTests(names: testClasses(source, module), module: dir, project: self),
+        )
+      },
+    )
+  }
+
+  """
+  One command and report shared by every selected test class check in this
+  reactor. Only the filtered selection reaches the command, never the calling
+  check's own identity, so every check builds the same command.
+  """
+  let runTests(ws: Workspace!, modules: MavenModules!): MavenTestResults! {
+    let discovered = modules
+      .entries
+      .filter { entry => modules.paths.contains(entry.directory) }
+    let narrowed = modules.narrowed or discovered.any { entry => entry.tests.narrowed }
+    testResults(
+      ws,
+      discovered.map { entry => MavenTestSelection(module: entry.directory, names: entry.tests.names) },
+      whole: narrowed == false,
+    )
+  }
+
+  # Every discovered class, as dagger check selects them with nothing removed.
+  let allTests(ws: Workspace!): [MavenTestSelection!]! {
+    modules(ws).entries.map { entry =>
+      MavenTestSelection(
+        module: entry.directory,
+        names: entry.tests.names,
+      )
+    }
+  }
+
+  # A whole selection runs verify, as a check of the reactor would. A narrowed
+  # one runs only the selected Surefire classes through the test phase. Test
+  # failures never stop the shared command, so every selected class reports;
+  # the indexer turns the reports and the exit code into the verdicts.
+  let testResults(
+    ws: Workspace!,
+    selections: [MavenTestSelection!]!,
+    whole: Boolean!,
+  ): MavenTestResults! {
+    let nonEmpty = selections.filter { selection => selection.names.length > 0 }
+    let ordered = tool.sorted(nonEmpty.map { selection => selection.module }.uniq).map { module =>
+      MavenTestSelection(
+        module: module,
+        names: tool.sorted(nonEmpty.filter { selection => selection.module == module }[0]!.names.uniq),
+      )
+    }
+    if (whole == false and ordered.isEmpty) { raise "no Maven test classes selected in project " + path }
+    let moduleIndex = 0
+    let lines = ordered.map { selection =>
+      let classIndex = 0
+      let rows = selection.names.map { name =>
+        let row = `${moduleIndex}` + "/" + `${classIndex}` + "\t" + selection.module + "\t" + name + "\n"
+        classIndex += 1
+        row
+      }
+      moduleIndex += 1
+      rows.join("")
+    }
+    let executed = if (whole) {
+      container(ws).withExec(
+        command(ws, ["verify"], ["--fail-at-end", "-Dmaven.test.failure.ignore=true"]),
+        expect: ANY,
+        redirectStdout: "/maven-test-output.log",
+        redirectStderr: "/maven-test-stderr.log",
+      )
+    } else {
+      selectionContainer(ws, ordered).withExec(
+        command(ws, ["test"], [
+          "--fail-at-end",
+          "-Dtest=",
+          "-Dsurefire.includesFile=.dagger-maven-tests/includes",
+          "-DfailIfNoTests=false",
+          "-Dmaven.test.failure.ignore=true",
+        ]),
+        expect: ANY,
+        redirectStdout: "/maven-test-output.log",
+        redirectStderr: "/maven-test-stderr.log",
+      )
+    }
+    let mode = if (whole) { "whole" } else { "narrowed" }
+    let indexed = tool
+      .reportImage
+      .withDirectory("/maven-test-report", tool.reportIndexer)
+      .withDirectory(
+        "/reports",
+        executed.directory("/src"),
+        include: ["**/target/surefire-reports/TEST-*.xml", "**/target/failsafe-reports/TEST-*.xml"],
+      )
+      # POMs map Maven's per-project failures to module directories.
+      .withDirectory("/poms", tool.source(ws), include: ["**/pom.xml"])
+      .withFile("/maven-test-output.log", executed.file("/maven-test-output.log"))
+      .withFile("/maven-test-stderr.log", executed.file("/maven-test-stderr.log"))
+      .withNewFile("/maven-test-selection.txt", lines.join(""))
+      .withExec([
+        "java", "-cp", "/maven-test-report", "MavenTestReport",
+        "--reports", "/reports",
+        "--log", "/maven-test-output.log",
+        "--stderr", "/maven-test-stderr.log",
+        "--selection", "/maven-test-selection.txt",
+        "--exit-code", `${executed.exitCode}`,
+        "--mode", mode,
+        "--poms", "/poms",
+        "--root", path,
+        "--output", "/maven-test-results",
+      ])
+    MavenTestResults(results: indexed.directory("/maven-test-results"), selections: ordered)
+  }
+
+  # Use module-relative selection files so two modules can have the same
   # class name without selecting one another's tests. Maven resolves File
   # parameters relative to each POM. The inverse exclusion also restricts any
   # includes already configured in the POM. An empty -Dtest clears CLI selectors
   # that would otherwise bypass Surefire's include/exclude files altogether.
-  let runClasses(ws: Workspace!, names: [String!]!): Container! {
-    let known = tests(ws).names
-    let missing = names.reject { name => known.contains(name) }
-    if (missing.isEmpty == false) {
-      raise "unknown Maven test classes: " + missing.join(", ")
-    }
-    if (names.isEmpty) {
-      container(ws)
-    } else {
-      let source = tool.source(ws)
-      let ready = pomDirectories(source).reduce(container(ws)) { ctr, module =>
-        let selected = names.filter { name =>
-          subpath(name.split("/").dropLast(1).join("/")).trimSuffix("/.") == module
-        }
-        let patterns = selected.map { name =>
-          "\\Q" + name.split("/").takeLast(1).join("").replace(old: ".", new: "/") + "\\E\\.class"
-        }
-        let includes = patterns.map { pattern => "%regex[" + pattern + "]" }.join("\n")
-        let excludes = if (patterns.isEmpty) { "%regex[.*]" } else {
-          "%regex[(?!" + patterns.map { pattern => pattern + "$" }.join("|") + ").*]"
-        }
-        let files = "/src/" + modulePath(module, ".dagger-maven-tests")
-        # Surefire accepts negated regexes in includesFile. Its excludesFile
-        # parser rejects every '!', including negative-lookahead syntax.
-        ctr.withNewFile(files + "/includes", includes + "\n!" + excludes + "\n")
+  # Every POM in the workspace gets a file, so aggregated siblings run nothing.
+  let selectionContainer(ws: Workspace!, selections: [MavenTestSelection!]!): Container! {
+    let empty: [String!]! = []
+    pomDirectories(tool.source(ws)).reduce(container(ws)) { ctr, module =>
+      let selected = selections.filter { selection => selection.module == module }
+      let names = if (selected.isEmpty) { empty } else { selected[0]!.names }
+      let patterns = names.map { name => "\\Q" + name.replace(old: ".", new: "/") + "\\E\\.class" }
+      let includes = patterns.map { pattern => "%regex[" + pattern + "]" }.join("\n")
+      let excludes = if (patterns.isEmpty) { "%regex[.*]" } else {
+        "%regex[(?!" + patterns.map { pattern => pattern + "$" }.join("|") + ").*]"
       }
-      let result = ready.withExec(command(ws, ["test"], [
-        "-Dtest=",
-        "-Dsurefire.includesFile=.dagger-maven-tests/includes",
-        "-DfailIfNoTests=false",
-        "-Dmaven.test.failure.ignore=false",
-      ]))
-      # Empty or inactive modules are normal in a reactor, but a requested class
-      # silently running zero tests is not. Inspect actual test cases, not merely
-      # a report filename (abstract helpers can produce empty reports).
-      let absent = names.reject { name =>
-        let module = name.split("/").dropLast(1).join("/")
-        let className = name.split("/").takeLast(1).join("")
-        let reports = result.directory(module).glob("target/surefire-reports/TEST-*.xml")
-        reports.any { report =>
-          let xml = result.directory(module).file(report).contents
-          xml.contains("classname=\"" + className + "\"") or xml.contains("classname=\"" + className + "$")
-        }
-      }
-      if (absent.isEmpty == false) {
-        raise "no test cases ran for Maven classes: " + absent.join(", ")
-          + "; check active profiles, source layout, skip flags, and Surefire XML report configuration"
-      }
-      result
+      # Surefire accepts negated regexes in includesFile. Its excludesFile
+      # parser rejects every '!', including negative-lookahead syntax.
+      ctr.withNewFile(
+        "/src/" + modulePath(module, ".dagger-maven-tests") + "/includes",
+        includes + "\n!" + excludes + "\n",
+      )
     }
   }
 
@@ -396,15 +525,29 @@ type MavenProject {
   }
 
   """
-  Run through verify: unit tests, packaging, integration tests, and quality gates.
+  Run through verify: unit tests, packaging, integration tests, and quality
+  gates. This check owns what no test class check owns: failures in modules
+  without discovered test classes and failures Maven attributes to no module.
+  A failing test class, or a failure in a module with test classes, fails
+  those checks instead, never this one too. It shares one Maven command with
+  this reactor's test class checks when none is selected out.
   """
   verify(ws: Workspace!): Void @check {
-    run(ws, ["verify"]).sync
+    let failure = verifyFailure(ws, complete: false)
+    if (failure != null) { raise failure }
     null
   }
 
-  let verifyFailure(ws: Workspace!): String {
-    { run(ws, ["verify"]).sync; null } rescue {
+  # complete includes the failures that test class checks own.
+  let verifyFailure(ws: Workspace!, complete: Boolean! = true): String {
+    {
+      if (tool.source(ws).glob(subpath("pom.xml")).isEmpty) {
+        raise "no pom.xml at Maven project root: " + path
+      }
+      let results = testResults(ws, allTests(ws), whole: true)
+      let failure = if (complete) { results.completeFailure } else { results.verifyFailure }
+      if (failure == "") { null } else { "Maven verify failed in " + path + ":\n" + failure }
+    } rescue {
       err: Error => err.message
     }
   }
@@ -441,58 +584,194 @@ type MavenProject {
 }
 
 """
-Java unit-test classes in one reactor. Keys combine the reactor-relative POM
-directory and class name. Selection is explicit and does not change verify.
+POM directories in one reactor, keyed by workspace-relative directory.
 """
-type MavenTestClasses @collection {
+type MavenModules @collection {
   """
-  Class keys, e.g. app/example.AppTest or ./example.RootTest.
+  Module directories relative to the workspace root.
   """
-  names: [String!]! @keys
+  paths: [String!]! @keys
+
+  """
+  Modules selected in or out since the collection was discovered.
+  """
+  delta: CollectionDelta @delta
+
+  """
+  Whether the active selection removed modules from this collection.
+  """
+  narrowed: Boolean! { delta == null or delta!.removedKeys.length > 0 }
+
+  """
+  Stored test class collections for the modules. The engine filters these
+  collections too when it passes a selected module set to a check.
+  """
+  entries: [MavenModuleSelection!]!
 
   let project: MavenProject!
 
   """
-  One test class by its module/class key.
+  The module in this directory.
   """
-  testClass(key: String!): MavenTestClass! @get {
-    MavenTestClass(key: key, project: project)
+  module(path: String!): MavenModule! @get {
+    MavenModule(path: path, tests: entries.filter { entry => entry.directory == path }[0]!.tests)
   }
 
   """
-  Run all selected classes in one Maven reactor invocation. Dependencies still
-  build in reactor order; unselected classes do not run. An empty subset is a no-op.
+  Run the selected test classes of these modules in one Maven command and fail
+  with every failing class. A plain function, not a check; with nothing
+  selected out it runs verify, the same command as dagger check.
   """
-  test(ws: Workspace!): Container! {
-    project.runClasses(ws, names)
+  test(ws: Workspace!): Void {
+    let selected = entries.filter { entry => paths.contains(entry.directory) and entry.tests.names.length > 0 }
+    if (selected.isEmpty == false) {
+      project.runTests(ws, self).assertAllPassed
+    }
+    null
+  }
+}
+
+"""
+A module directory and its stored test class collection.
+"""
+type MavenModuleSelection {
+  directory: String!
+  tests: MavenTests!
+}
+
+"""
+One POM directory in a reactor.
+"""
+type MavenModule {
+  """
+  Module directory relative to the workspace root.
+  """
+  path: String!
+
+  """
+  Java unit-test class candidates in this module, keyed by class name.
+  """
+  tests: MavenTests!
+}
+
+"""
+Java unit-test classes in one module, keyed by fully qualified class name.
+"""
+type MavenTests @collection {
+  """
+  Fully qualified class names, e.g. example.AppTest.
+  """
+  names: [String!]! @keys
+
+  """
+  Classes selected in or out since the collection was discovered.
+  """
+  delta: CollectionDelta @delta
+
+  """
+  Whether the active selection removed classes from this collection.
+  """
+  narrowed: Boolean! { delta == null or delta!.removedKeys.length > 0 }
+
+  let module: String!
+
+  let project: MavenProject!
+
+  """
+  The test class with this fully qualified name.
+  """
+  testClass(name: String!): MavenTest! @get {
+    MavenTest(name: name, module: module, project: project)
+  }
+
+  """
+  Run these classes in one Maven command, building reactor dependencies as
+  needed, and fail with every failing class. A plain function, not a check.
+  An empty subset does not run Maven.
+  """
+  test(ws: Workspace!): Void {
+    if (names.isEmpty == false) {
+      project.testResults(
+        ws,
+        [MavenTestSelection(module: module, names: names)],
+        whole: false,
+      ).assertAllPassed
+    }
+    null
   }
 }
 
 """
 One Java unit-test class discovered from a conventional source path.
 """
-type MavenTestClass {
+type MavenTest {
   """
-  Reactor-relative module directory followed by the fully qualified class name.
+  Fully qualified Java class name.
   """
-  key: String!
+  name: String!
+
+  """
+  Module directory relative to the workspace root.
+  """
+  module: String!
 
   let project: MavenProject!
 
   """
-  Module directory relative to the reactor root.
+  Run this test class. Every selected class in the reactor shares one Maven
+  command; this check reads only its own result.
   """
-  module: String! { key.split("/").dropLast(1).join("/") }
-
-  """
-  Fully qualified Java class name.
-  """
-  className: String! { key.split("/").takeLast(1).join("") }
-
-  """
-  Run this class, building reactor dependencies as needed.
-  """
-  test(ws: Workspace!): Container! {
-    project.runClasses(ws, [key])
+  test(ws: Workspace!, selection: MavenModules!): Void @check {
+    project.runTests(ws, selection).assertPassed(module, name)
   }
+}
+
+# The shared indexer keeps each result small, regardless of total report size.
+type MavenTestResults {
+  let results: Directory!
+  let selections: [MavenTestSelection!]!
+
+  # Numeric byte-order ranks, as the selection file assigned them, keep
+  # identifiers out of file paths.
+  let failure(module: String!, name: String!): String! {
+    let selected = selections.filter { selection => selection.module == module }
+    if (selected.isEmpty) { raise "Maven module is outside the test selection: " + module }
+    if (selected[0]!.names.contains(name) == false) {
+      raise "Maven test class is outside the selection: " + module + " " + name
+    }
+    let moduleIndex = selections.filter { selection => selection.module < module }.length
+    let classIndex = selected[0]!.names.filter { other => other < name }.length
+    results.file(`${moduleIndex}` + "/" + `${classIndex}`).contents
+  }
+
+  let assertPassed(module: String!, name: String!): Void {
+    let message = failure(module, name)
+    if (message != "") { raise "Maven tests in " + module + ": " + message }
+    null
+  }
+
+  let assertAllPassed: Void {
+    let empty: [String!]! = []
+    let failures = selections.reduce(empty) { all, selection =>
+      all + selection.names.map { name =>
+        let message = failure(selection.module, name)
+        if (message == "") { "" } else { "- " + selection.module + " " + name + ": " + message }
+      }.filter { message => message != "" }
+    }
+    if (failures.isEmpty == false) { raise "Maven tests failed:\n" + failures.join("\n") }
+    null
+  }
+
+  # What no class check owns: failures in modules without class checks and
+  # failures Maven does not attribute to a module. Empty when there are none.
+  let verifyFailure: String! { results.file("verify").contents }
+
+  # Every failure of the run, owned or not. Empty when the reactor passed.
+  let completeFailure: String! { results.file("all").contents }
+}
+
+# The helper's immutable copy of the filtered collection keys.
+type MavenTestSelection {
+  let module: String!
+  let names: [String!]!
 }
